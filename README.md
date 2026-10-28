@@ -1,3 +1,19 @@
+# AnkiDroid 火热连胜 · Study Streak
+
+这是基于 **AnkiDroid v2.25.3** 的个人修改版。完整源码保留在本仓库，增加完成每日计划才计入的连胜、7 天庆祝、真实完成 30 天奖励补签卡，以及原子化的连续多日补签。
+
+- [使用、安装与构建说明](STUDY_STREAK.md)
+- [架构与规则](docs/study-streak.md)
+- [测试结果](docs/study-streak-validation.json)：新增 46 项测试通过；相关既有测试 58 项通过、2 项原有跳过；Android lint 0 错误、0 警告。
+- [可应用于官方 v2.25.3 的补丁](patches/AnkiDroid-study-streak.patch)
+- [下载 Debug APK](https://github.com/Water5tar/ankidroid-study-streak/releases)
+
+Debug 版使用独立包名 `com.ichi2.anki.debug`，与正式版分开保存设置。请保留原版，通过导出／导入整个集合迁移卡片与进度；手势、主题等 Android 应用设置需另行配置。尚未进行真机运行、实际音效播放或实时 AnkiWeb 同步验证。
+
+本项目由 OpenAI Codex（GPT-6.1-sol）辅助实现，未向上游提交 PR。它不是官方发布版；官方项目的许可证、贡献规范与署名均保留。下面为上游 README。
+
+---
+
 <p align="center">
 <img alt="" src="docs/graphics/logos/banner_readme.png"/>
 </p>

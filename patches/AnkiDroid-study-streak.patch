@@ -1,0 +1,1548 @@
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
+index f0c5057..95dccbf 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/DeckPicker.kt
+@@ -1200,6 +1200,7 @@ open class DeckPicker :
+         // activity (see StudyOptionsFragment), and the menu host dispatches creation,
+         // preparation and selection to them. This activity never drives a fragment's menu.
+         menuInflater.inflate(R.menu.deck_picker, menu)
++        studyStreak.attach(menu.findItem(R.id.action_study_streak))
+         menu.findItem(R.id.deck_picker_action_filter)?.let {
+             toolbarSearchItem = it
+             setupSearchIcon(it)
+@@ -2212,9 +2213,15 @@ open class DeckPicker :
+     fun updateDeckList() {
+         launchCatchingTask {
+             withProgress { viewModel.updateDeckList().join() }
++            studyStreak.refresh()
+         }
+     }
+ 
++    private val studyStreak by lazy {
++        com.ichi2.anki.streak
++            .StreakUi(this)
++    }
++
+     private fun createIcon(shortcutData: ShortcutData) {
+         // This code should not be reachable with lower versions
+         val shortcut =
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/Reviewer.kt b/AnkiDroid/src/main/java/com/ichi2/anki/Reviewer.kt
+index bd00120..2b5ef10 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/Reviewer.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/Reviewer.kt
+@@ -1562,6 +1562,12 @@ open class Reviewer :
+     override suspend fun updateCurrentCard() {
+         val state =
+             withCol {
++                try {
++                    com.ichi2.anki.streak.StreakService
++                        .update(this@Reviewer, this, validateHistory = false)
++                } catch (error: Exception) {
++                    Timber.w(error, "Unable to refresh study streak")
++                }
+                 sched.currentQueueState()?.apply {
+                     topCard.renderOutput(this@withCol, reload = true)
+                 }
+@@ -1600,6 +1606,14 @@ open class Reviewer :
+         }
+ 
+         // showing the timebox reached dialog if the timebox is reached
++        withCol {
++            try {
++                com.ichi2.anki.streak.StreakService
++                    .update(this@Reviewer, this, answered = true, validateHistory = false, answeredDeckId = state.topCard.did)
++            } catch (error: Exception) {
++                Timber.w(error, "Unable to record study streak")
++            }
++        }
+         val timebox = withCol { timeboxReached() }
+         if (timebox != null) {
+             dealWithTimeBox(timebox)
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakPlan.kt b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakPlan.kt
+new file mode 100644
+index 0000000..5eabb7c
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakPlan.kt
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import com.ichi2.anki.libanki.Collection
++import java.time.Instant
++import java.time.ZoneId
++
++internal object StreakPlan {
++    fun complete(
++        col: Collection,
++        plan: Set<Long>,
++    ): Boolean {
++        if (plan.isEmpty()) return false
++        val tree = col.sched.deckDueTree(topDeckId = null) ?: return false
++        val exhausted =
++            plan.all { id ->
++                col.decks.findDeckInTree(tree, id)?.let {
++                    it.newCount == 0 && it.reviewCount == 0 && it.learnCount == 0
++                } == true
++            }
++        if (!exhausted) return false
++        val scope = plan.flatMap { col.decks.deckAndChildIds(it) }.toSet()
++        if (scope.isEmpty()) return false
++        // The deck tree respects daily limits, filtered decks and FSRS. Add a read-only
++        // guard for learning/relearning/filtered-preview due later in this learning day.
++        // Negative queues (buried/suspended) intentionally do not block completion.
++        val ids = scope.joinToString(",")
++        return col.db.queryLongScalar(
++            "select count(*) from cards where did in ($ids) and queue in (1,4) and due < ?",
++            col.sched.dayCutoff,
++        ) == 0L
++    }
++
++    fun dayStart(
++        cutoff: Long,
++        zone: ZoneId,
++        rolloverHour: Int = 4,
++    ): Long =
++        Instant
++            .ofEpochSecond(cutoff)
++            .atZone(zone)
++            .toLocalDate()
++            .minusDays(1)
++            .atTime(rolloverHour.coerceIn(0, 23), 0)
++            .atZone(zone)
++            .toInstant()
++            .toEpochMilli()
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakService.kt b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakService.kt
+new file mode 100644
+index 0000000..e17f7f2
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakService.kt
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import android.content.Context
++import com.ichi2.anki.common.time.TimeManager.time
++import com.ichi2.anki.libanki.Collection
++import java.time.ZoneId
++
++/** Call only inside CollectionManager.withCol, which serializes collection access. */
++object StreakService {
++    fun update(
++        context: Context,
++        col: Collection,
++        answered: Boolean = false,
++        validateHistory: Boolean = true,
++        answeredDeckId: Long? = null,
++    ): StreakState = updateWithStore(col, StreakStore(context, col), answered, validateHistory, answeredDeckId)
++
++    internal fun updateWithStore(
++        col: Collection,
++        store: StreakStore,
++        answered: Boolean = false,
++        validateHistory: Boolean = true,
++        answeredDeckId: Long? = null,
++    ): StreakState {
++        val before = store.read()
++        val day = col.sched.today
++        // Time travel cannot mint additional completions/rewards or rewrite later certificates.
++        if (day < before.planDay) return before
++        var state = before
++        if (state.planDay != day) {
++            state.pendingDay?.let { state = state.decline(it) }
++            state = state.copy(planDay = day, activePlan = emptySet(), answered = false)
++        }
++        if (answered && state.activePlan.isEmpty()) {
++            state = state.copy(activePlan = state.plan.ifEmpty { setOf(col.decks.selected()) })
++        }
++        val scope = state.activePlan.flatMap { col.decks.deckAndChildIds(it) }.toSet()
++        val scopeAnswer = answered && (answeredDeckId ?: col.decks.selected()) in scope
++        if (scopeAnswer) state = state.copy(answered = true)
++
++        // Revlog cannot prove old plan completion. Certificates start with this installation;
++        // their read-only fingerprints detect undo, import, deletion and changed sync history.
++        val valid =
++            state.completed.filter { (recordedDay, proof) ->
++                (!validateHistory && recordedDay != day) || fingerprint(col, proof.startMillis, proof.endMillis) == proof.fingerprint
++            }
++        val invalidatedToday = day in state.completed && day !in valid
++        state = state.reconcile(valid)
++        // An empty queue after sync/deletion is not a new completion observation.
++        // Only a fresh successful answer can certify today again.
++        if (invalidatedToday) state = state.copy(answered = scopeAnswer)
++        if (state.answered && scope.isNotEmpty()) {
++            val exhausted = StreakPlan.complete(col, state.activePlan)
++            val end = time.intTimeMS()
++            val start = StreakPlan.dayStart(col.sched.dayCutoff, ZoneId.systemDefault(), col.config.get("rollover") ?: 4)
++            val proof = if (exhausted) state.completed[day] ?: CompletionProof(start, end, fingerprint(col, start, end)) else null
++            state = state.observe(day, exhausted, proof)
++        }
++        if (state != before) store.write(state)
++        return state
++    }
++
++    fun mutate(
++        context: Context,
++        col: Collection,
++        transform: (StreakState) -> StreakState,
++    ): StreakState {
++        val store = StreakStore(context, col)
++        val before = store.read()
++        val after = transform(before)
++        if (after != before) store.write(after)
++        return after
++    }
++
++    private fun fingerprint(
++        col: Collection,
++        start: Long,
++        end: Long,
++    ): String {
++        val rows = StringBuilder()
++        col.db
++            .query(
++                "select id,cid,ease,ivl,lastIvl,factor,time,type from revlog where id >= ? and id <= ? order by id",
++                start,
++                end,
++            ).use { cursor ->
++                while (cursor.moveToNext()) {
++                    for (index in 0..7) rows.append(cursor.getLong(index)).append(':')
++                    rows.append(';')
++                }
++            }
++        return digest(rows.toString())
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakState.kt b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakState.kt
+new file mode 100644
+index 0000000..b491126
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakState.kt
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import kotlinx.serialization.Serializable
++
++/** A completion certificate, not a reconstruction from review counts. */
++@Serializable
++data class CompletionProof(
++    val startMillis: Long,
++    val endMillis: Long,
++    val fingerprint: String,
++)
++
++@Serializable
++data class StreakState(
++    val version: Int = 1,
++    val completed: Map<Int, CompletionProof> = emptyMap(),
++    val protected: Set<Int> = emptySet(),
++    val grants: List<Set<Int>> = emptyList(),
++    val spent: Int = 0,
++    val celebrated: Set<Int> = emptySet(),
++    val resolved: Set<Int> = emptySet(),
++    val pendingDay: Int? = null,
++    val plan: Set<Long> = emptySet(),
++    val activePlan: Set<Long> = emptySet(),
++    val planDay: Int = -1,
++    val answered: Boolean = false,
++    val animation: Boolean = true,
++    val sound: Boolean = true,
++) {
++    val days: Set<Int> get() = completed.keys + protected
++
++    // Invalidated grants remain as receipts: restoring a backup cannot award them twice.
++    val balance: Int get() = (grants.count { completed.keys.containsAll(it) } - spent).coerceAtLeast(0)
++
++    fun runEnding(day: Int): List<Int> {
++        val result = mutableListOf<Int>()
++        val recorded = days
++        var cursor = day
++        while (cursor in recorded) result.add(cursor--)
++        return result
++    }
++
++    /** Paid protection is a permanent local fact, even if today's plan becomes unfinished again. */
++    fun reconcile(valid: Map<Int, CompletionProof>): StreakState = copy(completed = valid, pendingDay = pendingDay?.takeIf { it in valid })
++
++    fun current(today: Int): Int = runEnding(if (today in days) today else today - 1).size
++
++    val longest: Int
++        get() {
++            var best = 0
++            var length = 0
++            var previous: Int? = null
++            for (day in days.sorted()) {
++                length = if (previous == day - 1) length + 1 else 1
++                best = maxOf(best, length)
++                previous = day
++            }
++            return best
++        }
++
++    fun missingBefore(day: Int): Int {
++        val previous = days.filter { it < day }.maxOrNull() ?: return 0
++        return day - previous - 1
++    }
++
++    /** No completion is minted from opening the app or a partial review. */
++    fun observe(
++        day: Int,
++        complete: Boolean,
++        proof: CompletionProof?,
++    ): StreakState {
++        if (!complete || proof == null) {
++            return copy(completed = completed - day, pendingDay = pendingDay.takeUnless { it == day })
++        }
++        val next = copy(completed = completed + (day to proof))
++        if (day in completed) return next
++        val gap = missingBefore(day)
++        return if (gap > 0 && day !in resolved) {
++            // Keep even an unaffordable request, so the UI explains why no cards were spent.
++            next.copy(pendingDay = day)
++        } else {
++            next.award(day)
++        }
++    }
++
++    /** Caller persists the returned object in ONE atomic write. Insufficient balance is a no-op. */
++    fun repair(day: Int): StreakState {
++        if (pendingDay != day || day !in completed) return this
++        val count = missingBefore(day)
++        if (count <= 0 || balance < count) return this
++        return copy(
++            protected = protected + ((day - count) until day),
++            spent = spent + count,
++            pendingDay = null,
++            resolved = resolved + day,
++        ).award(day)
++    }
++
++    fun decline(day: Int): StreakState = if (pendingDay == day) copy(pendingDay = null, resolved = resolved + day).award(day) else this
++
++    /** Each grant consumes 30 distinct REAL completions in this continuous (possibly protected) run. */
++    fun award(day: Int): StreakState {
++        val credited = grants.flatten().toSet()
++        val eligible = runEnding(day).filter { it in completed && it !in credited }.sorted()
++        return copy(grants = grants + eligible.chunked(30).filter { it.size == 30 }.map { it.toSet() })
++    }
++
++    /** Consume all crossed milestones, show only the latest when a repair crosses several. */
++    fun celebration(day: Int): Pair<StreakState, Int?> {
++        if (pendingDay != null) return this to null
++        val run = runEnding(day).sorted()
++        val milestones = run.filterIndexed { index, _ -> (index + 1) % 7 == 0 }
++        val fresh = milestones.filter { it !in celebrated }
++        return copy(celebrated = celebrated + milestones) to fresh.lastOrNull()?.let { run.indexOf(it) + 1 }
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakStore.kt b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakStore.kt
+new file mode 100644
+index 0000000..7909907
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakStore.kt
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import android.content.Context
++import android.util.AtomicFile
++import com.ichi2.anki.libanki.Collection
++import kotlinx.serialization.json.Json
++import java.io.File
++import java.security.MessageDigest
++
++/** Local, collection-scoped metadata. Never writes to collection.anki2 or AnkiWeb config. */
++class StreakStore internal constructor(
++    private val file: AtomicFile,
++) {
++    constructor(context: Context, col: Collection) : this(
++        AtomicFile(
++            File(
++                context.filesDir,
++                "study-streak-${digest("${col.colDb.canonicalPath}:${col.db.queryLongScalar("select crt from col")}")}.json",
++            ),
++        ),
++    )
++
++    fun read(): StreakState {
++        if (!file.baseFile.exists() && !File(file.baseFile.path + ".bak").exists()) return StreakState()
++        // Fail closed. Never silently replace a damaged/unknown ledger and reissue rewards.
++        return Json.decodeFromString<StreakState>(file.openRead().bufferedReader().use { it.readText() }).also {
++            require(it.version == 1) { "Unsupported study streak metadata" }
++        }
++    }
++
++    fun write(state: StreakState) {
++        val stream = file.startWrite()
++        try {
++            stream.write(Json.encodeToString(state).toByteArray(Charsets.UTF_8))
++            file.finishWrite(stream)
++        } catch (error: Exception) {
++            file.failWrite(stream)
++            throw error
++        }
++    }
++}
++
++internal fun digest(value: String): String =
++    MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakUi.kt b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakUi.kt
+new file mode 100644
+index 0000000..fda5e10
+--- /dev/null
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/streak/StreakUi.kt
+@@ -0,0 +1,312 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import android.animation.ValueAnimator
++import android.media.AudioManager
++import android.media.ToneGenerator
++import android.provider.Settings
++import android.view.Gravity
++import android.view.MenuItem
++import android.widget.GridLayout
++import android.widget.LinearLayout
++import android.widget.ScrollView
++import android.widget.TextView
++import androidx.appcompat.app.AlertDialog
++import androidx.appcompat.app.AppCompatActivity
++import androidx.appcompat.widget.SwitchCompat
++import androidx.lifecycle.DefaultLifecycleObserver
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleOwner
++import androidx.lifecycle.lifecycleScope
++import com.ichi2.anki.CollectionManager.withCol
++import com.ichi2.anki.R
++import com.ichi2.anki.common.android.animationEnabled
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import timber.log.Timber
++import java.time.Instant
++import java.time.ZoneId
++
++/** UI only: collection reads and the single-file commits run on withCol's dispatcher. */
++class StreakUi(
++    private val activity: AppCompatActivity,
++) : DefaultLifecycleObserver {
++    private var menu: MenuItem? = null
++    private var prompting = false
++    private var celebrationJob: Job? = null
++    private var repairDialog: AlertDialog? = null
++
++    init {
++        activity.lifecycle.addObserver(this)
++    }
++
++    override fun onPause(owner: LifecycleOwner) {
++        celebrationJob?.cancel()
++        repairDialog?.dismiss()
++    }
++
++    private fun visible(): Boolean = !activity.isFinishing && activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
++
++    fun attach(item: MenuItem) {
++        menu = item
++        item.setOnMenuItemClickListener {
++            details()
++            true
++        }
++        refresh()
++    }
++
++    fun refresh() {
++        activity.lifecycleScope.launch {
++            try {
++                val (state, day) = withCol { StreakService.update(activity, this) to sched.today }
++                menu?.title = activity.getString(R.string.streak_badge, state.current(day))
++                if (!prompting && visible()) {
++                    if (state.pendingDay == day) {
++                        repairPrompt(state, day)
++                    } else if (celebrationJob?.isActive != true) {
++                        celebrationJob =
++                            activity.lifecycleScope.launch {
++                                try {
++                                    celebrate(day)
++                                } catch (error: Exception) {
++                                    if (error is CancellationException) throw error
++                                    Timber.w(error, "Unable to celebrate study streak")
++                                }
++                            }
++                    }
++                }
++            } catch (error: Exception) {
++                if (error is CancellationException) throw error
++                Timber.w(error, "Study streak unavailable")
++                menu?.setTitle(R.string.streak_title)
++            }
++        }
++    }
++
++    private fun repairPrompt(
++        state: StreakState,
++        day: Int,
++    ) {
++        val missing = state.missingBefore(day)
++        val affordable = state.balance >= missing
++        prompting = true
++        repairDialog =
++            AlertDialog
++                .Builder(activity)
++                .setTitle(R.string.streak_repair_title)
++                .setMessage(activity.getString(R.string.streak_repair_message, missing, state.balance))
++                .setPositiveButton(if (affordable) R.string.streak_use_cards else R.string.streak_restart) { _, _ ->
++                    change { if (affordable) it.repair(day) else it.decline(day) }
++                }.setNegativeButton(if (affordable) R.string.streak_restart else android.R.string.cancel) { _, _ ->
++                    change { it.decline(day) }
++                }.setOnDismissListener {
++                    prompting = false
++                    repairDialog = null
++                }.show()
++    }
++
++    private fun change(transform: (StreakState) -> StreakState) {
++        activity.lifecycleScope.launch {
++            try {
++                withCol {
++                    StreakService.update(activity, this)
++                    StreakService.mutate(activity, this, transform)
++                }
++                refresh()
++            } catch (error: Exception) {
++                if (error is CancellationException) throw error
++                Timber.w(error, "Unable to save study streak")
++                AlertDialog
++                    .Builder(activity)
++                    .setMessage(R.string.streak_save_failed)
++                    .setPositiveButton(android.R.string.ok, null)
++                    .show()
++            }
++        }
++    }
++
++    private fun details() {
++        activity.lifecycleScope.launch {
++            try {
++                val snapshot =
++                    withCol {
++                        val state = StreakService.update(activity, this)
++                        Triple(state, sched.today, sched.dayCutoff)
++                    }
++                val (state, today, cutoff) = snapshot
++                val box =
++                    LinearLayout(activity).apply {
++                        orientation = LinearLayout.VERTICAL
++                        val padding = (20 * resources.displayMetrics.density).toInt()
++                        setPadding(padding, padding, padding, padding)
++                    }
++
++                fun label(text: String) =
++                    TextView(activity).also {
++                        it.text = text
++                        it.textSize = 16f
++                        it.setPadding(0, 8, 0, 8)
++                        box.addView(it)
++                    }
++                label(activity.getString(R.string.streak_summary, state.current(today), state.longest, state.balance))
++                label(activity.getString(if (today in state.completed) R.string.streak_done else R.string.streak_not_done))
++                val planNames =
++                    withCol {
++                        val ids = state.activePlan.ifEmpty { state.plan.ifEmpty { setOf(decks.selected()) } }
++                        decks.allNamesAndIds().filter { it.id in ids }.joinToString("\n") { it.name }
++                    }
++                label(activity.getString(R.string.streak_plan_names, planNames))
++                label(activity.getString(R.string.streak_rules))
++                val anchor =
++                    Instant
++                        .ofEpochSecond(cutoff)
++                        .atZone(ZoneId.systemDefault())
++                        .toLocalDate()
++                        .minusDays(1)
++                val calendar = GridLayout(activity).apply { columnCount = 7 }
++                ((today - 41)..today).forEach { day ->
++                    val status =
++                        when (day) {
++                            in state.completed -> activity.getString(R.string.streak_calendar_done)
++                            in state.protected -> activity.getString(R.string.streak_calendar_protected)
++                            else -> activity.getString(R.string.streak_calendar_empty)
++                        }
++                    val date = anchor.minusDays((today - day).toLong())
++                    calendar.addView(
++                        TextView(activity).apply {
++                            text = "${date.monthValue}/${date.dayOfMonth}\n${status.first()}"
++                            contentDescription = "$date $status"
++                            gravity = Gravity.CENTER
++                            textSize = 12f
++                            setPadding(0, 10, 0, 10)
++                            layoutParams =
++                                GridLayout.LayoutParams().apply {
++                                    width = 0
++                                    columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
++                                }
++                        },
++                    )
++                }
++                box.addView(calendar)
++                label(
++                    listOf(R.string.streak_calendar_done, R.string.streak_calendar_protected, R.string.streak_calendar_empty)
++                        .joinToString("  ") { activity.getString(it) },
++                )
++
++                fun toggle(
++                    title: Int,
++                    checked: Boolean,
++                    update: (StreakState, Boolean) -> StreakState,
++                ) {
++                    box.addView(
++                        SwitchCompat(activity).apply {
++                            setText(title)
++                            isChecked = checked
++                            setOnCheckedChangeListener { _, value -> change { update(it, value) } }
++                        },
++                    )
++                }
++                toggle(R.string.streak_animation, state.animation) { s, value -> s.copy(animation = value) }
++                toggle(R.string.streak_sound, state.sound) { s, value -> s.copy(sound = value) }
++                AlertDialog
++                    .Builder(activity)
++                    .setTitle(R.string.streak_title)
++                    .setView(ScrollView(activity).apply { addView(box) })
++                    .setPositiveButton(android.R.string.ok, null)
++                    .setNeutralButton(R.string.streak_plan) { _, _ -> choosePlan() }
++                    .show()
++            } catch (error: Exception) {
++                if (error is CancellationException) throw error
++                Timber.w(error, "Unable to open study streak")
++                AlertDialog
++                    .Builder(activity)
++                    .setMessage(R.string.streak_save_failed)
++                    .setPositiveButton(android.R.string.ok, null)
++                    .show()
++            }
++        }
++    }
++
++    private fun choosePlan() {
++        activity.lifecycleScope.launch {
++            try {
++                val (decks, state) = withCol { decks.allNamesAndIds() to StreakStore(activity, this).read() }
++                val selected = state.plan.toMutableSet()
++                AlertDialog
++                    .Builder(activity)
++                    .setTitle(R.string.streak_plan)
++                    .setMultiChoiceItems(
++                        decks.map { it.name }.toTypedArray(),
++                        decks.map { it.id in selected }.toBooleanArray(),
++                    ) { _, index, checked ->
++                        if (checked) selected.add(decks[index].id) else selected.remove(decks[index].id)
++                    }.setPositiveButton(android.R.string.ok) { _, _ -> change { it.copy(plan = selected.toSet()) } }
++                    .setNegativeButton(android.R.string.cancel, null)
++                    .show()
++            } catch (error: Exception) {
++                if (error is CancellationException) throw error
++                Timber.w(error, "Unable to choose study plan")
++                AlertDialog
++                    .Builder(activity)
++                    .setMessage(R.string.streak_save_failed)
++                    .setPositiveButton(android.R.string.ok, null)
++                    .show()
++            }
++        }
++    }
++
++    private suspend fun celebrate(day: Int) {
++        if (!visible()) return
++        var milestone: Int? = null
++        val state =
++            withCol {
++                StreakService.mutate(activity, this) {
++                    val (next, count) = it.celebration(day)
++                    milestone = count
++                    next
++                }
++            }
++        val count = milestone ?: return
++        // Receipt is committed before playback: a process death cannot replay a milestone.
++        var tone: ToneGenerator? = null
++        var dialog: AlertDialog? = null
++        var animator: ValueAnimator? = null
++        try {
++            if (state.sound) {
++                // Android's synthesized ACK tone: no bundled third-party audio asset.
++                tone = ToneGenerator(AudioManager.STREAM_MUSIC, 25)
++                tone.startTone(ToneGenerator.TONE_PROP_ACK, 180)
++            }
++            if (state.animation) {
++                val text =
++                    TextView(activity).apply {
++                        this.text = activity.getString(R.string.streak_celebration, count)
++                        textSize = 28f
++                        gravity = Gravity.CENTER
++                        setPadding(24, 32, 24, 32)
++                    }
++                dialog = AlertDialog.Builder(activity).setView(text).show()
++                val motion = Settings.Global.getFloat(activity.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f)
++                if (motion > 0f && activity.animationEnabled()) {
++                    animator =
++                        ValueAnimator.ofFloat(1f, 1.12f, 1f).apply {
++                            duration = 1400
++                            addUpdateListener {
++                                text.scaleX = it.animatedValue as Float
++                                text.scaleY = text.scaleX
++                            }
++                            start()
++                        }
++                }
++            }
++            delay(1600)
++        } finally {
++            animator?.cancel()
++            dialog?.dismiss()
++            tone?.release()
++        }
++    }
++}
+diff --git a/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/reviewer/ReviewerViewModel.kt b/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/reviewer/ReviewerViewModel.kt
+index 3e7aa4a..614043b 100644
+--- a/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/reviewer/ReviewerViewModel.kt
++++ b/AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/reviewer/ReviewerViewModel.kt
+@@ -15,6 +15,7 @@ import com.ichi2.anki.Flag
+ import com.ichi2.anki.Reviewer
+ import com.ichi2.anki.asyncIO
+ import com.ichi2.anki.cardviewer.SingleCardSide
++import com.ichi2.anki.common.android.appContext
+ import com.ichi2.anki.common.annotations.NeedsTest
+ import com.ichi2.anki.common.destinations.BrowserDestination
+ import com.ichi2.anki.common.destinations.CardInfoDestination
+@@ -47,6 +48,7 @@ import com.ichi2.anki.servicelayer.MARKED_TAG
+ import com.ichi2.anki.servicelayer.NoteService
+ import com.ichi2.anki.servicelayer.isBuryNoteAvailable
+ import com.ichi2.anki.servicelayer.isSuspendNoteAvailable
++import com.ichi2.anki.streak.StreakService
+ import com.ichi2.anki.tryRedo
+ import com.ichi2.anki.tryUndo
+ import com.ichi2.anki.ui.windows.reviewer.autoadvance.AnswerAction
+@@ -537,6 +539,13 @@ class ReviewerViewModel(
+             }
+ 
+         undoableOp(handler = this) { sched.answerCard(answer) }
++        withCol {
++            try {
++                StreakService.update(appContext, this, answered = true, validateHistory = false, answeredDeckId = card.did)
++            } catch (error: Exception) {
++                Timber.w(error, "Unable to record study streak")
++            }
++        }
+         answerFeedbackFlow.emit(rating)
+         savedStateHandle[KEY_PREVIOUS_CARD_ID] = card.id
+ 
+@@ -584,6 +593,11 @@ class ReviewerViewModel(
+         queueState =
+             asyncIO {
+                 withCol {
++                    try {
++                        StreakService.update(appContext, this, validateHistory = false)
++                    } catch (error: Exception) {
++                        Timber.w(error, "Unable to refresh study streak")
++                    }
+                     sched.currentQueueState()
+                 }
+             }
+diff --git a/AnkiDroid/src/main/res/menu/deck_picker.xml b/AnkiDroid/src/main/res/menu/deck_picker.xml
+index 2399f33..ca9ece6 100644
+--- a/AnkiDroid/src/main/res/menu/deck_picker.xml
++++ b/AnkiDroid/src/main/res/menu/deck_picker.xml
+@@ -5,6 +5,10 @@
+     xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:ankidroid="http://schemas.android.com/apk/res-auto"
+     >
++    <item
++        android:id="@+id/action_study_streak"
++        android:title="@string/streak_title"
++        ankidroid:showAsAction="always"/>
+     <item
+         android:id="@+id/deck_picker_action_filter"
+         android:icon="@drawable/ic_search_white"
+diff --git a/AnkiDroid/src/main/res/values-zh-rCN/streak.xml b/AnkiDroid/src/main/res/values-zh-rCN/streak.xml
+new file mode 100644
+index 0000000..c3d847a
+--- /dev/null
++++ b/AnkiDroid/src/main/res/values-zh-rCN/streak.xml
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
++<resources>
++    <string name="streak_title">火热连胜</string>
++    <string name="streak_badge">🔥 %1$d</string>
++    <string name="streak_summary">🔥 连续学习 %1$d 天\n最长连续：%2$d 天\n补签卡：%3$d 张</string>
++    <string name="streak_done">今日计划已全部完成 ✓</string>
++    <string name="streak_not_done">今日计划尚未全部完成</string>
++    <string name="streak_rules">完成计划内全部任务才计入连胜，包括今天稍后到期的学习卡。日期按 Anki 学习日切换。连续期间每实际完成 30 天奖励一张补签卡，受保护日不产生奖励。\n\n学习前选择牌组（包含子牌组）。不选择则以当天首次复习的牌组为计划。第一次作答后固定当天计划，此后修改明天生效。历史从启用本功能开始记录，仅保存在本机。</string>
++    <string name="streak_plan">选择计划牌组</string>
++    <string name="streak_plan_names">计划牌组（包含子牌组）：\n%1$s</string>
++    <string name="streak_calendar_done">● 已完成</string>
++    <string name="streak_calendar_protected">◆ 补签保护</string>
++    <string name="streak_calendar_empty">○ 未记录</string>
++    <string name="streak_animation">连胜庆祝动画</string>
++    <string name="streak_sound">连胜庆祝音效</string>
++    <string name="streak_celebration">🔥 连续学习 %1$d 天！</string>
++    <string name="streak_repair_title">保护你的连胜？</string>
++    <string name="streak_repair_message">你有 %1$d 天没有完成计划，恢复连胜需要 %1$d 张补签卡。你目前有 %2$d 张。只有能一次恢复全部缺失日时才会扣卡。</string>
++    <string name="streak_use_cards">使用补签卡</string>
++    <string name="streak_restart">结束此前连胜</string>
++    <string name="streak_save_failed">无法读取或保存连胜数据。正常复习不受影响，请稍后重试。</string>
++</resources>
+diff --git a/AnkiDroid/src/main/res/values/streak.xml b/AnkiDroid/src/main/res/values/streak.xml
+new file mode 100644
+index 0000000..04f1c4d
+--- /dev/null
++++ b/AnkiDroid/src/main/res/values/streak.xml
+@@ -0,0 +1,23 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
++<resources>
++    <string name="streak_title" maxLength="28">Study streak</string>
++    <string name="streak_badge">🔥 %1$d</string>
++    <string name="streak_summary">🔥 Current: %1$d days\nLongest: %2$d days\nRepair cards: %3$d</string>
++    <string name="streak_done">Today’s plan is complete ✓</string>
++    <string name="streak_not_done">Today’s plan is not complete</string>
++    <string name="streak_rules">Finish every scheduled task in your plan, including learning cards due later today. Days follow Anki’s rollover. Each 30 real completed days in a continuous run earns one repair card; protected days do not earn cards.\n\nChoose decks (including their children) before studying. An empty selection uses the first deck you review that day. The plan locks on your first answer; changes then apply tomorrow. History begins with this feature and stays on this device.</string>
++    <string name="streak_plan">Choose plan decks</string>
++    <string name="streak_plan_names">Plan (including subdecks):\n%1$s</string>
++    <string name="streak_calendar_done">● Completed</string>
++    <string name="streak_calendar_protected">◆ Protected</string>
++    <string name="streak_calendar_empty">○ Not recorded</string>
++    <string name="streak_animation">Streak celebration animation</string>
++    <string name="streak_sound">Streak celebration sound</string>
++    <string name="streak_celebration">🔥 %1$d day streak!</string>
++    <string name="streak_repair_title">Protect your streak?</string>
++    <string name="streak_repair_message">You missed %1$d days. Restoring this streak requires %1$d repair cards. You have %2$d. Cards are only spent if all missing days can be restored.</string>
++    <string name="streak_use_cards">Use repair cards</string>
++    <string name="streak_restart">End previous streak</string>
++    <string name="streak_save_failed">Study streak data could not be read or saved. Your reviews are unaffected. Please try again.</string>
++</resources>
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakDayTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakDayTest.kt
+new file mode 100644
+index 0000000..65fe178
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakDayTest.kt
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import org.junit.jupiter.api.Test
++import java.time.Duration
++import java.time.LocalDateTime
++import java.time.ZoneId
++import kotlin.test.assertEquals
++
++class StreakDayTest {
++    @Test
++    fun `rollover at nonexistent DST hour preserves the previous day's configured boundary`() {
++        val zone = ZoneId.of("America/New_York")
++        val cutoff = LocalDateTime.parse("2026-03-08T02:00").atZone(zone).toEpochSecond()
++        val previous =
++            LocalDateTime
++                .parse("2026-03-07T02:00")
++                .atZone(zone)
++                .toInstant()
++                .toEpochMilli()
++        assertEquals(previous, StreakPlan.dayStart(cutoff, zone, 2))
++    }
++
++    @Test
++    fun `rollover boundaries preserve month year and leap day`() {
++        val zone = ZoneId.of("Asia/Singapore")
++        for ((cutoff, start) in listOf(
++            "2026-11-01T04:00" to "2026-10-31T04:00",
++            "2027-01-01T04:00" to "2026-12-31T04:00",
++            "2028-03-01T04:00" to "2028-02-29T04:00",
++        )) {
++            val end = LocalDateTime.parse(cutoff).atZone(zone).toEpochSecond()
++            assertEquals(
++                LocalDateTime
++                    .parse(start)
++                    .atZone(zone)
++                    .toInstant()
++                    .toEpochMilli(),
++                StreakPlan.dayStart(end, zone),
++            )
++        }
++    }
++
++    @Test
++    fun `DST day is not assumed to last 86400 seconds`() {
++        val zone = ZoneId.of("America/New_York")
++        val end = LocalDateTime.parse("2026-03-08T04:00").atZone(zone).toEpochSecond()
++        assertEquals(Duration.ofHours(23).toMillis(), end * 1000 - StreakPlan.dayStart(end, zone))
++    }
++
++    @Test
++    fun `timezone and custom rollover use the scheduler supplied cutoff`() {
++        for (name in listOf("Asia/Tokyo", "America/Los_Angeles", "Europe/London")) {
++            val zone = ZoneId.of(name)
++            val end = LocalDateTime.parse("2026-10-28T06:00").atZone(zone)
++            assertEquals(end.minusDays(1).toInstant().toEpochMilli(), StreakPlan.dayStart(end.toEpochSecond(), zone, 6))
++        }
++    }
++}
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakPlanTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakPlanTest.kt
+new file mode 100644
+index 0000000..11371e7
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakPlanTest.kt
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import anki.scheduler.CardAnswer.Rating
++import com.ichi2.anki.RobolectricTest
++import com.ichi2.anki.common.time.TimeManager
++import com.ichi2.anki.libanki.CardType
++import com.ichi2.anki.libanki.QueueType
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++@RunWith(AndroidJUnit4::class)
++class StreakPlanTest : RobolectricTest() {
++    @Before
++    fun alignNativeAndKotlinClocks() {
++        // RobolectricTest pins Kotlin time to 2020, but Rust's scheduler uses real time.
++        // A deck tree requested for 2020 legitimately has different limits/burial state.
++        TimeManager.reset()
++    }
++
++    @Test
++    fun `daily new card limit defines plan rather than every card in deck`() {
++        val card = addBasicNote("one").firstCard()
++        addBasicNote("two")
++        val config = col.decks.configDictForDeckId(card.did)
++        config.new.perDay = 1
++        col.decks.save(config)
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        assertTrue(
++            StreakPlan.complete(col, setOf(card.did)),
++            "tree=${col.sched.deckDueTree(topDeckId = card.did)} queue=${col.sched.counts()}",
++        )
++    }
++
++    @Test
++    fun `relearning later today must finish`() {
++        val card = addBasicNote().firstCard()
++        card.queue = QueueType.Lrn
++        card.type = CardType.Relearning
++        card.due = (col.sched.dayCutoff - 60).toInt()
++        col.updateCards(listOf(card), skipUndoEntry = true)
++        assertFalse(StreakPlan.complete(col, setOf(card.did)))
++    }
++
++    @Test
++    fun `FSRS completes through the same native scheduler without modifying history`() {
++        col.config.set("fsrs", true)
++        val card = addBasicNote().firstCard()
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        val history = col.db.queryLongScalar("select count(*) from revlog")
++        assertTrue(StreakPlan.complete(col, setOf(card.did)))
++        assertEquals(history, col.db.queryLongScalar("select count(*) from revlog"))
++    }
++
++    @Test
++    fun `partial review does not exhaust plan but final answer does`() {
++        addBasicNote("one")
++        addBasicNote("two")
++        val plan = setOf(col.decks.selected())
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        assertFalse(StreakPlan.complete(col, plan))
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        assertTrue(StreakPlan.complete(col, plan))
++    }
++
++    @Test
++    fun `learning later today blocks completion even outside learn ahead`() {
++        val card = addBasicNote().firstCard()
++        card.queue = QueueType.Lrn
++        card.type = CardType.Lrn
++        card.due = (col.sched.dayCutoff - 60).toInt()
++        col.updateCards(listOf(card), skipUndoEntry = true)
++        assertFalse(StreakPlan.complete(col, setOf(card.did)))
++    }
++
++    @Test
++    fun `buried and suspended cards do not block completion`() {
++        val one = addBasicNote("one").firstCard()
++        val two = addBasicNote("two").firstCard()
++        col.sched.buryCards(listOf(one.id), true)
++        col.sched.suspendCards(listOf(two.id))
++        assertTrue(
++            StreakPlan.complete(col, setOf(one.did)),
++            "tree=${col.sched.deckDueTree(topDeckId = one.did)} queue=${col.sched.counts()}",
++        )
++    }
++
++    @Test
++    fun `all selected decks must be finished while unselected decks do not block`() {
++        val one = addBasicNote("one").firstCard()
++        val second = col.decks.id("Second")
++        val two = addBasicNote("two").firstCard()
++        two.did = second
++        col.updateCards(listOf(two), skipUndoEntry = true)
++        col.decks.select(one.did)
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        assertTrue(StreakPlan.complete(col, setOf(one.did)))
++        assertFalse(StreakPlan.complete(col, setOf(one.did, second)))
++        col.decks.select(second)
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        assertTrue(StreakPlan.complete(col, setOf(one.did, second)))
++    }
++
++    @Test
++    fun `parent plan includes children`() {
++        val parent = col.decks.id("Parent")
++        val child = col.decks.id("Parent::Child")
++        val card = addBasicNote().firstCard()
++        card.did = child
++        col.updateCards(listOf(card), skipUndoEntry = true)
++        assertFalse(StreakPlan.complete(col, setOf(parent)))
++    }
++
++    @Test
++    fun `missing or empty plan cannot complete`() {
++        assertFalse(StreakPlan.complete(col, emptySet()))
++        assertFalse(StreakPlan.complete(col, setOf(Long.MAX_VALUE)))
++    }
++
++    @Test
++    fun `filtered deck uses native limits and completion`() {
++        addBasicNote()
++        addDynamicDeck("Filtered", "")
++        val plan = setOf(col.decks.selected())
++        assertFalse(StreakPlan.complete(col, plan))
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        assertTrue(StreakPlan.complete(col, plan))
++    }
++
++    @Test
++    fun `probe does not change review history or selected deck`() {
++        val card = addBasicNote().firstCard()
++        val selected = col.decks.selected()
++        val reviews = col.db.queryLongScalar("select count(*) from revlog")
++        repeat(3) { StreakPlan.complete(col, setOf(card.did)) }
++        assertEquals(selected, col.decks.selected())
++        assertEquals(reviews, col.db.queryLongScalar("select count(*) from revlog"))
++    }
++}
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakServiceTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakServiceTest.kt
+new file mode 100644
+index 0000000..5257752
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakServiceTest.kt
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import android.util.AtomicFile
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import anki.scheduler.CardAnswer.Rating
++import com.ichi2.anki.RobolectricTest
++import com.ichi2.anki.common.time.TimeManager
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.junit.runner.RunWith
++import java.io.File
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++@RunWith(AndroidJUnit4::class)
++class StreakServiceTest : RobolectricTest() {
++    @get:Rule
++    val streakFolder = TemporaryFolder()
++
++    private val store get() = StreakStore(AtomicFile(File(streakFolder.root, "streak.json")))
++
++    @Before
++    fun alignClocks() {
++        TimeManager.reset()
++    }
++
++    @Test
++    fun `observer only records after all scheduled answers and survives store restart`() {
++        addBasicNote("one")
++        addBasicNote("two")
++        assertTrue(StreakService.updateWithStore(col, store).completed.isEmpty())
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        assertTrue(StreakService.updateWithStore(col, store, answered = true).completed.isEmpty())
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        val state = StreakService.updateWithStore(col, store, answered = true)
++        assertEquals(1, state.current(col.sched.today))
++        assertEquals(state, store.read())
++        assertEquals(state, StreakService.updateWithStore(col, store))
++    }
++
++    @Test
++    fun `first answer fixes scope for day even after plan setting changes`() {
++        addBasicNote("one")
++        addBasicNote("two")
++        val first = col.decks.selected()
++        val second = col.decks.id("Other")
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        val state = StreakService.updateWithStore(col, store, answered = true)
++        store.write(state.copy(plan = setOf(second)))
++        assertEquals(setOf(first), StreakService.updateWithStore(col, store).activePlan)
++    }
++
++    @Test
++    fun `invalidated today cannot be re-certified by an empty synced queue`() {
++        addBasicNote()
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        val today = col.sched.today
++        val state = StreakService.updateWithStore(col, store, answered = true)
++        store.write(state.copy(completed = mapOf(today to state.completed.getValue(today).copy(fingerprint = "replaced"))))
++        val after = StreakService.updateWithStore(col, store)
++        assertFalse(today in after.completed)
++        assertFalse(after.answered)
++        assertTrue(StreakService.updateWithStore(col, store).completed.isEmpty())
++    }
++
++    @Test
++    fun `reviewing a child through its parent certifies the selected child plan`() {
++        val parent = col.decks.id("Parent")
++        val child = col.decks.id("Parent::Child")
++        val card = addBasicNote().firstCard()
++        card.did = child
++        col.updateCards(listOf(card), skipUndoEntry = true)
++        col.decks.select(parent)
++        store.write(StreakState(plan = setOf(child)))
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        val state = StreakService.updateWithStore(col, store, answered = true, answeredDeckId = child)
++        assertTrue(col.sched.today in state.completed)
++    }
++
++    @Test
++    fun `changed review evidence invalidates historical completion without changing revlog`() {
++        addBasicNote()
++        col.sched.answerCard(col.sched.card!!, Rating.EASY)
++        val today = col.sched.today
++        val state = StreakService.updateWithStore(col, store, answered = true)
++        // Simulate a sync replacing historical numeric review evidence.
++        val historical = state.completed.getValue(today).copy(fingerprint = "different-history")
++        store.write(state.copy(completed = mapOf(today - 1 to historical), activePlan = emptySet(), answered = false))
++        val reviews = col.db.queryLongScalar("select count(*) from revlog")
++        val after = StreakService.updateWithStore(col, store)
++        assertFalse(today - 1 in after.completed)
++        assertEquals(reviews, col.db.queryLongScalar("select count(*) from revlog"))
++    }
++}
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakStateTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakStateTest.kt
+new file mode 100644
+index 0000000..5571a0a
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakStateTest.kt
+@@ -0,0 +1,210 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import kotlinx.serialization.json.Json
++import org.junit.jupiter.api.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class StreakStateTest {
++    @Test
++    fun `sync invalidation truncates real streak evidence but preserves paid protection`() {
++        val state = days(60).observe(63, true, proof).repair(63)
++        val invalid = state.reconcile(state.completed - 60)
++        assertEquals(setOf(61, 62), invalid.protected)
++        assertEquals(2, invalid.spent)
++        assertEquals(0, invalid.balance)
++        assertEquals(3, invalid.current(63))
++    }
++
++    @Test
++    fun `dynamic new tasks after repair preserve paid protection without charging again`() {
++        val repaired = days(60).observe(63, true, proof).repair(63)
++        val partial = repaired.observe(63, false, null)
++        val refreshed = partial.reconcile(partial.completed)
++        val finished = refreshed.observe(63, true, proof)
++        assertEquals(setOf(61, 62), finished.protected)
++        assertEquals(63, finished.current(63))
++        assertEquals(2, finished.spent)
++        assertEquals(0, finished.balance)
++    }
++
++    private val proof = CompletionProof(1, 2, "test")
++
++    private fun days(count: Int): StreakState = (1..count).fold(StreakState()) { state, day -> state.observe(day, true, proof) }
++
++    @Test
++    fun `partial work and an empty app launch cannot complete a day`() {
++        assertEquals(0, StreakState().observe(1, false, proof).current(1))
++        assertEquals(0, StreakState().observe(1, true, null).current(1))
++    }
++
++    @Test
++    fun `complete plans increment once per learning day`() {
++        assertEquals(1, days(1).observe(1, true, proof).current(1))
++        assertEquals(7, days(7).current(7))
++        assertEquals(7, days(7).current(8))
++        assertEquals(0, days(7).current(9))
++    }
++
++    @Test
++    fun `30 and 60 real days issue one and two cards`() {
++        assertEquals(0, days(29).balance)
++        assertEquals(1, days(30).balance)
++        assertEquals(2, days(60).balance)
++    }
++
++    @Test
++    fun `repeated completion and recalculation do not duplicate grants`() {
++        var state = days(60)
++        repeat(10) { state = state.observe(60, true, proof).award(60) }
++        assertEquals(2, state.balance)
++        assertEquals(2, state.grants.size)
++    }
++
++    @Test
++    fun `seven day celebration is consumed once and survives serialization`() {
++        val (state, count) = days(7).celebration(7)
++        assertEquals(7, count)
++        val restarted = Json.decodeFromString<StreakState>(Json.encodeToString(state))
++        assertNull(restarted.celebration(7).second)
++    }
++
++    @Test
++    fun `no celebration before seven or while repair is pending`() {
++        assertNull(days(6).celebration(6).second)
++        assertNull(days(30).observe(32, true, proof).celebration(32).second)
++    }
++
++    @Test
++    fun `one missing day without a card starts a new run without spending`() {
++        val state = days(7).observe(9, true, proof)
++        assertEquals(state, state.repair(9))
++        assertEquals(1, state.decline(9).current(9))
++        assertEquals(0, state.spent)
++    }
++
++    @Test
++    fun `one missing day uses exactly one card`() {
++        val state = days(37).observe(39, true, proof).repair(39)
++        assertEquals(39, state.current(39))
++        assertEquals(setOf(38), state.protected)
++        assertEquals(0, state.balance)
++    }
++
++    @Test
++    fun `declining keeps balance and cannot be reversed by repeated completion`() {
++        val state = days(37).observe(39, true, proof).decline(39).observe(39, true, proof)
++        assertEquals(1, state.current(39))
++        assertEquals(1, state.balance)
++        assertNull(state.pendingDay)
++        assertEquals(state, state.repair(39))
++    }
++
++    @Test
++    fun `two missing days are all restored or none`() {
++        val insufficient = days(37).observe(40, true, proof)
++        assertEquals(insufficient, insufficient.repair(40))
++        assertTrue(insufficient.protected.isEmpty())
++        assertEquals(1, insufficient.balance)
++        val sufficient = days(60).observe(63, true, proof).repair(63)
++        assertEquals(setOf(61, 62), sufficient.protected)
++        assertEquals(63, sufficient.current(63))
++        assertEquals(0, sufficient.balance)
++    }
++
++    @Test
++    fun `three missing days consume three cards atomically`() {
++        val state = days(90).observe(94, true, proof).repair(94)
++        assertEquals(setOf(91, 92, 93), state.protected)
++        assertEquals(94, state.current(94))
++        assertEquals(3, state.spent)
++        assertEquals(0, state.balance)
++        assertEquals(state, state.repair(94))
++    }
++
++    @Test
++    fun `protected day crossing 60 does not create a card`() {
++        val state = days(58).observe(60, true, proof).repair(60)
++        assertEquals(60, state.current(60))
++        assertEquals(0, state.balance)
++        assertEquals(1, state.grants.size)
++        val next = state.observe(61, true, proof)
++        assertEquals(1, next.balance)
++        assertEquals(2, next.grants.size)
++        assertTrue(next.grants.all { grant -> grant.none { it in next.protected } })
++    }
++
++    @Test
++    fun `protected days cannot bootstrap an unlimited reward cycle`() {
++        var state = days(90).observe(94, true, proof).repair(94)
++        repeat(100) { state = state.award(94) }
++        assertEquals(0, state.balance)
++        assertEquals(3, state.grants.size)
++    }
++
++    @Test
++    fun `repair crossing multiple milestones only presents latest and consumes all`() {
++        val base = days(300).celebration(300).first
++        val state = base.observe(311, true, proof).repair(311)
++        val (marked, count) = state.celebration(311)
++        assertEquals(308, count)
++        assertNull(marked.celebration(311).second)
++        assertEquals(0, marked.balance)
++    }
++
++    @Test
++    fun `stale repair response does not spend cards`() {
++        val state = days(60).observe(63, true, proof)
++        assertEquals(state, state.repair(62))
++        assertEquals(state, state.repair(64))
++    }
++
++    @Test
++    fun `new run requires 30 new real completions`() {
++        var state = days(59).observe(61, true, proof).decline(61)
++        for (day in 62..89) state = state.observe(day, true, proof)
++        assertEquals(1, state.balance)
++        state = state.observe(90, true, proof)
++        assertEquals(2, state.balance)
++    }
++
++    @Test
++    fun `invalidated evidence removes unspent entitlement without reissuing on restore`() {
++        val state = days(30)
++        val invalid = state.copy(completed = state.completed - 15)
++        assertEquals(0, invalid.balance)
++        assertEquals(15, invalid.current(30))
++        val restored = invalid.copy(completed = state.completed).award(30)
++        assertEquals(1, restored.balance)
++        assertEquals(1, restored.grants.size)
++    }
++
++    @Test
++    fun `undo final completion removes today and its reward`() {
++        val state = days(30).observe(30, false, proof)
++        assertFalse(30 in state.completed)
++        assertEquals(29, state.current(30))
++        assertEquals(0, state.balance)
++    }
++
++    @Test
++    fun `pending repair and all metadata survive restart`() {
++        val state = days(60).observe(63, true, proof)
++        assertEquals(state, Json.decodeFromString<StreakState>(Json.encodeToString(state)))
++    }
++
++    @Test
++    fun `longest is derived from evidence rather than a stale counter`() {
++        val state = days(30).observe(35, true, proof).decline(35)
++        assertEquals(30, state.longest)
++        assertEquals(1, state.current(35))
++    }
++
++    @Test
++    fun `historical revlog alone never initializes a streak`() {
++        assertEquals(0, StreakState().current(1000))
++    }
++}
+diff --git a/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakStoreTest.kt b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakStoreTest.kt
+new file mode 100644
+index 0000000..4aaa52c
+--- /dev/null
++++ b/AnkiDroid/src/test/java/com/ichi2/anki/streak/StreakStoreTest.kt
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package com.ichi2.anki.streak
++
++import android.util.AtomicFile
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import org.junit.runner.RunWith
++import kotlin.test.assertEquals
++import kotlin.test.assertFails
++
++@RunWith(AndroidJUnit4::class)
++class StreakStoreTest {
++    @get:Rule
++    val folder = TemporaryFolder()
++
++    @Test
++    fun `restart preserves the entire atomic repair result`() {
++        val file = folder.newFile()
++        val store = StreakStore(AtomicFile(file))
++        val proof = CompletionProof(1, 2, "proof")
++        val before = (1..60).fold(StreakState()) { s, d -> s.observe(d, true, proof) }.observe(63, true, proof)
++        store.write(before)
++        val repaired = store.read().repair(63)
++        store.write(repaired)
++        assertEquals(repaired, StreakStore(AtomicFile(file)).read())
++    }
++
++    @Test
++    fun `failed transaction retains original card balance and all days`() {
++        val file = folder.newFile()
++        val atomic = AtomicFile(file)
++        val store = StreakStore(atomic)
++        val state = StreakState(spent = 2, protected = setOf(31, 32))
++        store.write(state)
++        val interrupted = atomic.startWrite()
++        interrupted.write("incomplete write".toByteArray())
++        atomic.failWrite(interrupted)
++        assertEquals(state, store.read())
++    }
++
++    @Test
++    fun `corrupt ledger is not silently reset to a new reward account`() {
++        val file = folder.newFile()
++        file.writeText("broken")
++        assertFails { StreakStore(AtomicFile(file)).read() }
++        assertEquals("broken", file.readText())
++    }
++}
+diff --git a/docs/study-streak.md b/docs/study-streak.md
+new file mode 100644
+index 0000000..bb17d5a
+--- /dev/null
++++ b/docs/study-streak.md
+@@ -0,0 +1,125 @@
++<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
++# Local study streak
++
++This downstream feature targets v2.25.3 (d9bf072f814a0c37d30a694192593b31ff2df875).
++It was implemented with OpenAI Codex assistance. It is not an upstream contribution;
++upstream AI_POLICY.md and contribution eligibility must be considered separately.
++
++## Integration and plan semantics
++
++The deck picker toolbar opens a local streak detail dialog with a 42-learning-day
++calendar, current/longest run, repair balance, plan selection and two celebration
++switches. Filled circles are completed plans; diamonds are protected days.
++
++Select one or more decks before the first answer. Descendants are included.
++An empty selection defaults to the deck selected for the first answer that day.
++The first answer freezes the daily scope. Later changes affect the next learning
++day. This makes 'all tasks' explicit without making an unrelated unused deck
++block completion. Parent plans include child decks. Existing deck daily limits
++continue to define which new/review cards belong to today's work.
++
++Both the classic Reviewer and the newer ReviewerViewModel report successful
++answers after the existing undoable operation, and
++refreshes the observer when the current card changes (including undo). DeckPicker
++refreshes after collection refresh and when creating its toolbar. The observer is
++isolated from ordinary review errors: unavailable streak metadata never prevents
++reviewing or answering cards.
++
++StreakPlan uses the native scheduler's deck due tree, including its daily limits,
++filtered-deck handling and FSRS scheduling, and requires zero new/review/learning
++counts for every selected root. It additionally reads intraday learning and
++filtered preview queues due before scheduler.dayCutoff, so a learning card beyond
++learn-ahead does not incorrectly qualify as finished. Buried/suspended negative
++queues do not block completion. No selection changes are made to probe decks.
++
++Completion also requires an observed successful answer in the daily scope.
++Empty plans and opening the app alone never qualify. Filtered preview sessions
++can qualify once their tasks are exhausted: their local answer observation is
++needed because non-rescheduling previews may not produce actual revlog rows.
++
++## Boundaries and evidence
++
++Keys use scheduler.today, not wall-clock midnight. Revlog evidence starts at the
++previous local rollover reconstructed from scheduler.dayCutoff and the configured
++rollover hour (including nonexistent DST hours, not a fixed 86,400 seconds).
++Calendar labels are derived from
++the current rollover and local zone. Backward day movement does not mint or
++overwrite completions; the user must reach the previously observed learning day.
++
++Revlog alone does not preserve historical daily plan, options, or due queues.
++Consequently no pre-installation streak is fabricated. A completion certificate
++records the observed successful completion plus a SHA-256 fingerprint of revlog
++rows up to the observation. Fingerprints are read-only and use raw numeric fields.
++
++On a deck-picker refresh, changed evidence (undo, deletion, import, full sync)
++invalidates certificates and recomputes derived streak counts. Paid protected
++dates remain permanent local facts; reopening today's plan with dynamic tasks
++cannot discard protection already purchased or charge the same dates again.
++Invalidated current-day evidence requires a fresh successful answer to recertify.
++On review, only current-day evidence is checked to avoid re-reading years of
++history per answer. Appended reviews after the certificate do not invalidate it.
++Historical preview-only activity without revlog cannot be independently checked
++after sync; the persisted local completion observation remains its evidence.
++Historical insertions inside its interval conservatively invalidate it: this
++feature cannot reconstruct the old plan. Remote-device reviews alone cannot
++certify plan completion. Importing a different collection with a different
++creation timestamp gets separate metadata. This is local-only, not cross-device
++streak synchronization or tamper-resistant anti-cheat.
++
++## Pure rules and persistence
++
++StreakState is an immutable serializable value. Current and longest runs are
++derived from completion and protection days. Today's unfinished state preserves
++yesterday's run until the day ends. A gap followed by a genuine completed plan
++persists a pending repair decision, including when cards are insufficient.
++Dismissal preserves the choice; if a new learning day starts, the old pending
++choice is declined. A stale dialog cannot repair a different day.
++
++Repair requires N available cards for N consecutive missing days. The domain
++returns either the unchanged value or a complete replacement containing all
++protected dates and the entire debit. The replacement is committed once through
++Android AtomicFile. I/O errors retain the old file; malformed or unknown-version
++metadata is not silently reset. CollectionManager.withCol serializes operations.
++
++One card is awarded for each group of 30 previously uncredited REAL completion
++days in the current continuous run. Protected days extend that run but are never
++reward evidence. A declined/unaffordable gap restarts the real-day accumulation.
++Grant receipts retain their exact 30 days permanently. Lost evidence removes
++that grant from available entitlement, and spent cards are never duplicated or
++refunded by recalculation. Restoring evidence can restore entitlement but cannot
++issue a second receipt for those same days. Balance is clamped at zero when
++previous spending exceeds remaining valid entitlement.
++
++Milestones use each seventh day's identity in a run; consumed receipts survive
++restarts. When a repair crosses several milestones, all are consumed and only
++the latest is presented. Receipts are saved before playback, so an interrupted
++playback may be skipped but cannot replay on restart. Disabled celebrations are
++also consumed. A new independent run can celebrate its own seven-day milestones.
++
++Metadata: application-private files/study-streak-<SHA256(path:collection-crt)>.json.
++It includes the ledger, grant and celebration receipts, spending, pending choice,
++daily/configured plan and settings. It is not written into collection schema,
++revlog, scheduler settings, FSRS, or AnkiWeb configuration. App-data deletion
++removes it; normal collection export/sync does not carry it.
++
++## Assets and accessibility
++
++The badge uses the platform's fire glyph. Animation is an original 1.4-second
++scale pulse, dismissed after 1.6 seconds. Existing AnkiDroid animation preferences
++and Android animator scale are respected. Each calendar cell exposes a full
++date/status description and uses distinct shapes, not color alone.
++Sound is Android ToneGenerator's synthesized TONE_PROP_ACK at 25% generator
++volume on STREAM_MUSIC. It respects media volume and bundles no audio assets.
++Transient celebrations stop when the deck-picker activity pauses.
++No Duolingo assets or new libraries are used. New source uses GPL-3.0-or-later.
++
++## Validation
++
++New tests cover the pure ledger, reward receipts, atomic repair, restarts,
++day boundaries/DST, AtomicFile rollback and native scheduler plan semantics.
++Observer tests exercise plan freezing, complete/partial plans, child-deck answers,
++store restarts and invalidated current/historical evidence. Classic and newer
++reviewer paths report answers. A process death between the review commit and the
++local metadata commit can undercount a day; an empty queue alone never backfills it.
++The accompanying delivery report records actual command results and limitations;
++the existence of a test is not evidence that it passed.

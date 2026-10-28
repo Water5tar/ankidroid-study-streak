@@ -1,0 +1,80 @@
+{
+    "baseTag": "v2.25.3",
+    "baseCommit": "d9bf072f814a0c37d30a694192593b31ff2df875",
+    "branch": "feature/study-streak",
+    "changedFiles": 17,
+    "tests": [
+        {
+            "name": "com.ichi2.anki.libanki.SchedulerTest",
+            "tests": 35,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 2
+        },
+        {
+            "name": "com.ichi2.anki.streak.StreakDayTest",
+            "tests": 4,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+        },
+        {
+            "name": "com.ichi2.anki.streak.StreakPlanTest",
+            "tests": 11,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+        },
+        {
+            "name": "com.ichi2.anki.streak.StreakServiceTest",
+            "tests": 5,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+        },
+        {
+            "name": "com.ichi2.anki.streak.StreakStateTest",
+            "tests": 23,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+        },
+        {
+            "name": "com.ichi2.anki.streak.StreakStoreTest",
+            "tests": 3,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+        },
+        {
+            "name": "com.ichi2.anki.StudyOptionsViewModelTest",
+            "tests": 21,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+        },
+        {
+            "name": "com.ichi2.anki.ui.windows.reviewer.ReviewerViewModelTest",
+            "tests": 4,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0
+        }
+    ],
+    "newTestsPassed": 46,
+    "totalPassed": 104,
+    "totalSkipped": 2,
+    "formatter": "passed",
+    "ktlintCheck": "passed",
+    "androidLint": {
+        "warnings": 0,
+        "errors": 0,
+        "hints": 30
+    },
+    "assembleFullDebug": "passed",
+    "apksignerVerify": "passed-all-four-ABIs",
+    "patchApplyCheck": "passed against base index",
+    "sourceArchiveCheck": "all 17 changed files match",
+    "deviceValidation": false,
+    "liveAnkiWebValidation": false
+}
