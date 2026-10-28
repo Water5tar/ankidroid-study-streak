@@ -15,6 +15,7 @@ import com.ichi2.anki.Flag
 import com.ichi2.anki.Reviewer
 import com.ichi2.anki.asyncIO
 import com.ichi2.anki.cardviewer.SingleCardSide
+import com.ichi2.anki.common.android.appContext
 import com.ichi2.anki.common.annotations.NeedsTest
 import com.ichi2.anki.common.destinations.BrowserDestination
 import com.ichi2.anki.common.destinations.CardInfoDestination
@@ -47,6 +48,7 @@ import com.ichi2.anki.servicelayer.MARKED_TAG
 import com.ichi2.anki.servicelayer.NoteService
 import com.ichi2.anki.servicelayer.isBuryNoteAvailable
 import com.ichi2.anki.servicelayer.isSuspendNoteAvailable
+import com.ichi2.anki.streak.StreakService
 import com.ichi2.anki.tryRedo
 import com.ichi2.anki.tryUndo
 import com.ichi2.anki.ui.windows.reviewer.autoadvance.AnswerAction
@@ -537,6 +539,13 @@ class ReviewerViewModel(
             }
 
         undoableOp(handler = this) { sched.answerCard(answer) }
+        withCol {
+            try {
+                StreakService.update(appContext, this, answered = true, validateHistory = false, answeredDeckId = card.did)
+            } catch (error: Exception) {
+                Timber.w(error, "Unable to record study streak")
+            }
+        }
         answerFeedbackFlow.emit(rating)
         savedStateHandle[KEY_PREVIOUS_CARD_ID] = card.id
 
@@ -584,6 +593,11 @@ class ReviewerViewModel(
         queueState =
             asyncIO {
                 withCol {
+                    try {
+                        StreakService.update(appContext, this, validateHistory = false)
+                    } catch (error: Exception) {
+                        Timber.w(error, "Unable to refresh study streak")
+                    }
                     sched.currentQueueState()
                 }
             }

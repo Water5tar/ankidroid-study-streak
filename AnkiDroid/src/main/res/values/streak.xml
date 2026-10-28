@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<resources>
+    <string name="streak_title" maxLength="28">Study streak</string>
+    <string name="streak_badge">🔥 %1$d</string>
+    <string name="streak_summary">🔥 Current: %1$d days\nLongest: %2$d days\nRepair cards: %3$d</string>
+    <string name="streak_done">Today’s plan is complete ✓</string>
+    <string name="streak_not_done">Today’s plan is not complete</string>
+    <string name="streak_rules">Finish every scheduled task in your plan, including learning cards due later today. Days follow Anki’s rollover. Each 30 real completed days in a continuous run earns one repair card; protected days do not earn cards.\n\nChoose decks (including their children) before studying. An empty selection uses the first deck you review that day. The plan locks on your first answer; changes then apply tomorrow. History begins with this feature and stays on this device.</string>
+    <string name="streak_plan">Choose plan decks</string>
+    <string name="streak_plan_names">Plan (including subdecks):\n%1$s</string>
+    <string name="streak_calendar_done">● Completed</string>
+    <string name="streak_calendar_protected">◆ Protected</string>
+    <string name="streak_calendar_empty">○ Not recorded</string>
+    <string name="streak_animation">Streak celebration animation</string>
+    <string name="streak_sound">Streak celebration sound</string>
+    <string name="streak_celebration">🔥 %1$d day streak!</string>
+    <string name="streak_repair_title">Protect your streak?</string>
+    <string name="streak_repair_message">You missed %1$d days. Restoring this streak requires %1$d repair cards. You have %2$d. Cards are only spent if all missing days can be restored.</string>
+    <string name="streak_use_cards">Use repair cards</string>
+    <string name="streak_restart">End previous streak</string>
+    <string name="streak_save_failed">Study streak data could not be read or saved. Your reviews are unaffected. Please try again.</string>
+</resources>

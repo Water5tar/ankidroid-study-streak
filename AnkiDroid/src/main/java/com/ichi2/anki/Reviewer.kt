@@ -1562,6 +1562,12 @@ open class Reviewer :
     override suspend fun updateCurrentCard() {
         val state =
             withCol {
+                try {
+                    com.ichi2.anki.streak.StreakService
+                        .update(this@Reviewer, this, validateHistory = false)
+                } catch (error: Exception) {
+                    Timber.w(error, "Unable to refresh study streak")
+                }
                 sched.currentQueueState()?.apply {
                     topCard.renderOutput(this@withCol, reload = true)
                 }
@@ -1600,6 +1606,14 @@ open class Reviewer :
         }
 
         // showing the timebox reached dialog if the timebox is reached
+        withCol {
+            try {
+                com.ichi2.anki.streak.StreakService
+                    .update(this@Reviewer, this, answered = true, validateHistory = false, answeredDeckId = state.topCard.did)
+            } catch (error: Exception) {
+                Timber.w(error, "Unable to record study streak")
+            }
+        }
         val timebox = withCol { timeboxReached() }
         if (timebox != null) {
             dealWithTimeBox(timebox)

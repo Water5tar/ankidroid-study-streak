@@ -6,6 +6,10 @@
     xmlns:ankidroid="http://schemas.android.com/apk/res-auto"
     >
     <item
+        android:id="@+id/action_study_streak"
+        android:title="@string/streak_title"
+        ankidroid:showAsAction="always"/>
+    <item
         android:id="@+id/deck_picker_action_filter"
         android:icon="@drawable/ic_search_white"
         android:title="@string/search_decks"

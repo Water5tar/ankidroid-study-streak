@@ -1200,6 +1200,7 @@ open class DeckPicker :
         // activity (see StudyOptionsFragment), and the menu host dispatches creation,
         // preparation and selection to them. This activity never drives a fragment's menu.
         menuInflater.inflate(R.menu.deck_picker, menu)
+        studyStreak.attach(menu.findItem(R.id.action_study_streak))
         menu.findItem(R.id.deck_picker_action_filter)?.let {
             toolbarSearchItem = it
             setupSearchIcon(it)
@@ -2212,7 +2213,13 @@ open class DeckPicker :
     fun updateDeckList() {
         launchCatchingTask {
             withProgress { viewModel.updateDeckList().join() }
+            studyStreak.refresh()
         }
+    }
+
+    private val studyStreak by lazy {
+        com.ichi2.anki.streak
+            .StreakUi(this)
     }
 
     private fun createIcon(shortcutData: ShortcutData) {
